@@ -1,6 +1,8 @@
 import discord
 from discord.ext import commands
 
+from ignora.token import token
+
 import os
 
 from music import music_cog
@@ -16,6 +18,5 @@ async def on_ready():
 bot.add_cog(music_cog(bot))
 
 
-bot.run("OTI3MzM1NTg3MzY1NjYyNzQx.GmMDUX.oc5b0-TIkFJZcjIqD-Qn5uIoUTcBlVycBMxly8")
+bot.run(token())
 
-#bot.run("OTI3MzM1NTg3MzY1NjYyNzQx.GmMDUX.oc5b0-TIkFJZcjIqD-Qn5uIoUTcBlVycBMxly8")
