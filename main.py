@@ -13,4 +13,4 @@ async def on_ready():
     await bot.add_cog(music_cog(bot))
     pass
 
-bot.run("OTI3MzM1NTg3MzY1NjYyNzQx.GNzh8D.aePzrjpX3plQT_eoOaz70-ekM9PqczN9I9yUjY")
+bot.run("TOKEN")
