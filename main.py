@@ -1,22 +1,16 @@
 import discord
 from discord.ext import commands
-
-from ignora.token import token
-
 import os
 
 from music import music_cog
 
-bot = commands.Bot(command_prefix='$')
 
+bot = commands.Bot(command_prefix='$',intents = discord.Intents.all())
 
 @bot.event
 async def on_ready():
-    print('We have logged in as {0.user}'.format(bot))
+    print('Entrando al servidor como {0.user}'.format(bot))
+    await bot.add_cog(music_cog(bot))
     pass
 
-bot.add_cog(music_cog(bot))
-
-
-bot.run(token())
-
+bot.run("OTI3MzM1NTg3MzY1NjYyNzQx.GNzh8D.aePzrjpX3plQT_eoOaz70-ekM9PqczN9I9yUjY")

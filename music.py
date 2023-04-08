@@ -1,115 +1,121 @@
 import discord
 from discord.ext import commands
 from discord.utils import get
+import os
 
-from youtube_dl import YoutubeDL
+import yt_dlp as youtube_dl
 
 class music_cog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-    
-        self.is_playing = False
+	def __init__(self, botr):
+		self.bot = botr
+		self.is_playing = False
+		self.music_info = [] #variable donde se almacenara la informacion del video
+		self.YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist':'True'}
+		self.FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
+		self.voice_channel = ""
+		self.vc = ""
 
-        # 2d array contiene [song, channel]
-        self.music_queue = []
-        self.YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist':'True'}
-        self.FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
+	def descargar(self, item):
+		try:
+			ydl = youtube_dl.YoutubeDL(self.YDL_OPTIONS)
+			info = ydl.extract_info("ytsearch:%s" % item ,download=False)['entries'][0]
+		except Exception:
+			return False
+		return {'source': info['url'], 'title': info['title']}
 
-        self.vc = ""
+	@commands.command(name="play", help="play")
+	async def p(self, ctx, *args):
+		query = " ".join(args)
+		self.voice_channel = ctx.author.voice.channel
 
-        self.i = -1
+		if self.voice_channel is None:
+			await ctx.send("No estas conectado a ningun canal de voz")
+		else: 
+			cancion = self.descargar(query)
+			if(cancion == False):
+				await ctx.send("No se pudo descargar la canción. Formato incorrecto pruebe con otra palabra clave. Esto podría deberse a una lista de reproducción o un formato de transmisión en vivo.")
+			else:
+				await ctx.send("Cancion agregada a tu cola")
+				self.music_info.append(cancion)
 
-        self.voice_channel = ""
+				if self.is_playing == False: 
+					await self.reproducir(ctx)
 
-     #busca en youtube
-    def search_yt(self, item):
-        with YoutubeDL(self.YDL_OPTIONS) as ydl:
-            try: 
-                info = ydl.extract_info("ytsearch:%s" % item, download=False)['entries'][0]
-            except Exception: 
-                return False
+	async def reproducir(self, ctx):
+		if len(self.music_info) != 0:
+			self.is_playing = True
 
-        return {'source': info['formats'][0]['url'], 'title': info['title']}
+			m_url = self.music_info[0]['source'] 
 
-    def play_next(self):
-        if len(self.music_queue) > (self.i+1):
-            self.is_playing = True
+			if self.vc == "" or not self.vc.is_connected() or self.vc == None:
+				self.vc = await self.voice_channel.connect()
+			#else:
+			#	await self.vc.move_to(self.voice_channel.connect())
 
-            self.i += 1
-            m_url = self.music_queue[self.i][0]['source']      
-            self.vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda e: self.play_next())
-        else:
-            self.is_playing = False
-            self.music_queue = ""
-            self.i = -1
+			await ctx.send("Reproduciendo :" + self.music_info[0]['title'])
 
-    # comprobación de bucle infinito 
-    async def play_music(self):
-        if len(self.music_queue) > (self.i+1):
-            self.is_playing = True
+			self.music_info.pop(0)
 
-            self.i += 1
-            m_url = self.music_queue[self.i][0]['source']
+			self.vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda e: self.play_next(ctx))
+		else: 
+			self.is_playing = False
 
-            
-            #intente conectarse al canal de voz si aún no está conectado
+	def play_next(self,ctx):
+		if len(self.music_info) != 0:
+			self.is_playing = True
+			m_url = self.music_info[0]['source']
+			self.music_info.pop(0)
+			self.vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda e: self.play_next(ctx))
+		else:
+			self.is_playing = False
 
-            if self.vc == "" or not self.vc.is_connected() or self.vc == None:
-                self.vc = await self.music_queue[0][1].connect()
-            else:
-                await self.vc.move_to(self.music_queue[0][1])
-            
-            print(self.music_queue)
-            self.vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda e: self.play_next())
-        else:
-            self.is_playing = False
-            self.music_queue = ""
-            self.i = -1
+	@commands.command(name="skip", help="skip")
+	async def skip(self,ctx):
+		self.vc.stop()
+		if self.vc != "" and self.vc:
+			self.play_next(ctx)
 
+	@commands.command(name="desconectar",help="Desconectar bot")
+	async def dc(self, ctx):
+		await self.vc.disconnect()
 
+	@commands.command(name="next",help="lista")
+	async def lst(self,ctx):
+		res = ""
+		for i in range(0, len(self.music_info)):
+			res += f"{i+1}.{self.music_info[i]['title']} \n"
 
-    @commands.command(name="play", help="play")
-    async def p(self, ctx, *args):
-        query = " ".join(args)
-        
-        self.voice_channel = ctx.author.voice.channel
-        if self.voice_channel is None:
-            await ctx.send("No estas conectado a un canal de voz")
-        else:
-            song = self.search_yt(query)
-            if type(song) == type(True):
-                await ctx.send("No se pudo descargar la canción. Formato incorrecto pruebe con otra palabra clave. Esto podría deberse a una lista de reproducción o un formato de transmisión en vivo.")
-            else:
-                await ctx.send("Cancion agregada a tu cola")
-                self.music_queue.append([song,self.voice_channel])
-                
-                print(self.music_queue)
-                
-                if self.is_playing == False:
-                    await self.play_music()
+		if res != "":
+			await ctx.send(res)
+		else:
+			await ctx.send("No hay canciones en tu cola")
 
-    @commands.command(name="lista", help="Muestra la canciones en cola")
-    async def q(self, ctx):
-        retval = ""
-        for i in range(0, len(self.music_queue)):
-            retval += i + ". " +self.music_queue[i][0]['title'] + "\n"
-        print(retval)
-        if retval != "":
-            await ctx.send(retval)
-        else:
-            await ctx.send("No hay caniones tu cola")
+	@commands.command(name="link",help="link")
+	async def lk(self,ctx,*args):
+		query = " ".join(args)
+		cancion = self.descargar(query)
+		await ctx.send(cancion['source'])
 
-    @commands.command(name="skip", help="Skip")
-    async def skip(self, ctx):
-        self.vc.stop()
-        if self.vc != "" and self.vc:
-            self.play_next()
-            
-    @commands.command(name="desconectar", help="Desconectar bot")
-    async def dc(self, ctx):
-        await self.vc.disconnect()
-
+	@commands.command(name="playlist",help="agergar lista")
+	async def lis(self,ctx,*args):
+		query = " ".join(args)
+		await os.system("python3 -m yt_dlp --get-filename -o \"%(playlist_title)s - %(title)s - %(id)s\" https://www.youtube.com/playlist?list=PLhESAgWGwV_G4BSOpZaycYE55ioNAkEsA > lista.txt")
+		datos = []
+		with open("lista.txt") as fname:
+			lineas = fname.readlines()
+			for linea in lineas:
+				datos.append(linea.strip('\n'))
+		print(datos)
+		# youtube-dl -i --get-filename --skip-download https://www.youtube.com/playlist?list=PLm9l7EEbJuhyDYNuItj3sG8h3xAZbjIxr
+		# youtube-dl --get-filename -o "%(playlist_title)s - %(title)s - %(id)s"  
 
 
 
-    
+
+
+
+
+
+
+
+
