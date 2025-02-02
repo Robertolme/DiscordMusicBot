@@ -1,163 +1,247 @@
 import discord
 from discord.ext import commands
-from discord.utils import get
-import os
 import yt_dlp as youtube_dl
-from discord import Button, ButtonStyle
-import json
+import asyncio
+import re
+from typing import Optional, Deque, Dict
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
-class MusicCog(commands.Cog,discord.ui.View):
-    def __init__(self, bot):
+class MusicConfig:
+    def __init__(self):
+        self.max_queue_size = 50
+        self.max_song_length = 600  # 10 minutos en segundos
+        self.inactivity_timeout = 300  # 5 minutos
+        self.max_retries = 3
+        self.default_volume = 0.5
+        self.allowed_formats = ['bestaudio/best']
+
+class MusicCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.is_playing = False
-        self.music_info = []  # variable donde se almacenará la información del video
-        self.YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist': 'True'}
-        self.FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-                                'options': '-vn'}
-        self.voice_channel = None
-        self.vc = None
-        #self.canciones_reproducidas = self.cargar_registro()
+        self.config = MusicConfig()
+        self.is_playing: bool = False
+        self.nightcore_active = False
+        self.music_queue: Deque[Dict[str, str]] = deque()
+        self.voice_channel: Optional[discord.VoiceChannel] = None
+        self.vc: Optional[discord.VoiceClient] = None
+        self.volume = self.config.default_volume
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        
+        self.stats = {
+            'songs_played': 0,
+            'total_queue_time': 0.0,
+            'errors': 0
+        }
 
-    def descargar(self, item):
+        self.YDL_OPTIONS = {
+            'format': self.config.allowed_formats[0],
+            'noplaylist': True,
+            'quiet': True,
+            'socket_timeout': 10,
+            'default_search': 'auto',
+        }
+
+        self.FFMPEG_OPTIONS_DEFAULT = {
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
+            'options': '-vn -b:a 128k -bufsize 1024k', 
+        }
+
+        self.FFMPEG_OPTIONS_NIGHTCORE = {
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
+            'options': '-vn -af "atempo=1.2, asetrate=44100*1.2"'
+        }
+
+        self.FFMPEG_OPTIONS = self.FFMPEG_OPTIONS_DEFAULT
+
+    @lru_cache(maxsize=100)
+    def descargar(self, query: str) -> Optional[Dict[str, str]]:
+        """Descarga información de la canción con caché LRU."""
         try:
-            ydl = youtube_dl.YoutubeDL(self.YDL_OPTIONS)
-            info = ydl.extract_info("ytsearch:%s" % item, download=False)['entries'][0]
-            return {'source': info['url'], 'title': info['title']}
-        except Exception as e:
-            print("Error al descargar la canción:", e)
-            return False
-
-    @commands.command(name="play", help="play")
-    async def play(self, ctx, *args, send_message=True):
-        query = " ".join(args)
-        self.voice_channel = ctx.author.voice.channel
-
-        if self.voice_channel is None:
-            await ctx.send("No estás conectado a ningún canal de voz")
-        else:
-            cancion = self.descargar(query)
-            if cancion is False:
-                await ctx.send(
-                    "No se pudo descargar la canción. Formato incorrecto, pruebe con otra palabra clave. Esto podría "
-                    "deberse a una lista de reproducción o un formato de transmisión en vivo."
-                )
-            else:
-                if send_message:
-                    await ctx.send("Canción agregada a tu cola")
+            with youtube_dl.YoutubeDL(self.YDL_OPTIONS) as ydl:
+                info = ydl.extract_info(query, download=False)
+                if 'entries' in info:
+                    info = info['entries'][0]
                 
-                self.music_info.append(cancion)
+                if info.get('duration', 0) > self.config.max_song_length:
+                    raise ValueError("Canción demasiado larga")
+                
+                return {
+                    'source': info['url'],
+                    'title': info['title'],
+                    'duration': info.get('duration', 0)
+                }
+        except Exception as e:
+            print(f"Error en descarga: {e}")
+            return None
 
+    async def descargar_async(self, query: str) -> Optional[Dict[str, str]]:
+        """Ejecuta la descarga en un thread separado."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, lambda: self.descargar(query))
 
-                if not self.is_playing:
-                    await self.reproducir(ctx)
+    async def reproducir(self, ctx: commands.Context, retries: int = None):
+        """Maneja la reproducción con reintentos y manejo de errores."""
+        retries = retries or self.config.max_retries
+        
+        try:
+            if not self.music_queue:
+                self.is_playing = False
+                await self.start_inactivity_timer()
+                return
 
-    async def reproducir(self, ctx):
-        if self.music_info:
+            if self.vc and (self.vc.is_playing() or self.vc.is_paused()):
+                return
+
             self.is_playing = True
-
-            m_url = self.music_info[0]['source']
-            name = self.music_info[0]['title']
-
-            #self.canciones_reproducidas.append(name)
-            #self.guardar_registro()
+            cancion = self.music_queue.popleft()
 
             if self.vc is None or not self.vc.is_connected():
-                self.vc = await self.voice_channel.connect()
+                self.vc = await self.voice_channel.connect(reconnect=True, timeout=30)
 
-            await ctx.send("Reproduciendo: " + self.music_info[0]['title'])
-
-            self.music_info.pop(0)
-
-            self.vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda e: self.play_next(ctx))
-        else:
-            self.is_playing = False
-
-    def play_next(self, ctx):
-        if self.music_info:
-            self.is_playing = True
-            m_url = self.music_info[0]['source']
-            name = self.music_info[0]['title']
-            #self.canciones_reproducidas.append(name)
-            #self.guardar_registro()
-            self.music_info.pop(0)
-            self.vc.play(discord.FFmpegPCMAudio(m_url, **self.FFMPEG_OPTIONS), after=lambda e: self.play_next(ctx))
-        else:
-            self.is_playing = False
-
-    @commands.command(name="skip", help="skip")
-    async def skip(self, ctx):
-        if self.vc and self.vc.is_playing():
             self.vc.stop()
-            self.play_next(ctx)
+            source = discord.FFmpegPCMAudio(cancion['source'], **self.FFMPEG_OPTIONS)
+            source = discord.PCMVolumeTransformer(source, self.volume)
 
-    @commands.command(name="disconnect", help="Desconectar bot")
-    async def disconnect(self, ctx):
+            await ctx.send(f"Reproduciendo: **{cancion['title']}**")
+            self.stats['songs_played'] += 1
+            self.stats['total_queue_time'] += cancion['duration']
+
+            self.vc.play(source, after=lambda e: (
+                self.bot.loop.create_task(self.handle_playback_error(e, ctx)) if e else
+                self.bot.loop.create_task(self.reproducir(ctx))
+            ))
+
+        except discord.ClientException as e:
+            print(f"ClientException: {e}")
+            if retries > 0:
+                await asyncio.sleep(1)
+                await self.reproducir(ctx, retries-1)
+        except Exception as e:
+            print(f"Error en reproducción: {e}")
+            await ctx.send("Error al reproducir la canción")
+            await self.cleanup()
+
+    async def handle_playback_error(self, error: Exception, ctx: commands.Context):
+        """Maneja errores de reproducción."""
+        if error:
+            print(f"Error en playback: {error}")
+            self.stats['errors'] += 1
+            await ctx.send("Error al reproducir la canción, intentando siguiente...")
+        await self.reproducir(ctx)
+
+    async def start_inactivity_timer(self):
+        """Inicia el temporizador de inactividad."""
+        await asyncio.sleep(self.config.inactivity_timeout)
+        if not self.is_playing and self.vc:
+            await self.cleanup()
+
+    async def cleanup(self):
+        """Limpia todos los recursos."""
         if self.vc and self.vc.is_connected():
             await self.vc.disconnect()
+        self.vc = None
+        self.music_queue.clear()
+        self.is_playing = False
+        self.descargar.cache_clear()
 
-    @commands.command(name="next", help="lista")
-    async def queue(self, ctx):
-        if self.music_info:
-            res = ""
-            for i, song in enumerate(self.music_info, start=1):
-                res += f"{i}. {song['title']}\n"
-            await ctx.send(res)
-        else:
-            await ctx.send("No hay canciones en tu cola")
+    def in_voice_channel():
+        """Decorador para verificar canal de voz."""
+        async def predicate(ctx):
+            if not ctx.author.voice:
+                await ctx.send("Debes estar en un canal de voz!")
+                return False
+            return True
+        return commands.check(predicate)
 
-    @commands.command(name="link", help="link")
-    async def get_link(self, ctx, *args):
-        query = " ".join(args)
-        cancion = self.descargar(query)
-        await ctx.send(cancion['source'] if cancion else "No se encontró el enlace.")
+    @commands.command(name="play", help="Reproduce una canción o añade a tu cola")
+    @in_voice_channel()
+    async def play(self, ctx: commands.Context, *, query: str):
+        """Maneja el comando de reproducción con validaciones."""
+        self.voice_channel = ctx.author.voice.channel
 
-    def obtener_nombres_mix_youtube(self, url_mix):
-        try:
-            # Configura las opciones de youtube_dl para obtener solo el título de los videos
-            ydl_opts = {
-                'ignoreerrors': True,
-                'quiet': True,
-                'extract_flat': 'in_playlist',
-                'skip_download': True,
-                'format': 'best'
-            }
+        if len(self.music_queue) >= self.config.max_queue_size:
+            await ctx.send("Tu esta Cola llena, intente más tarde")
+            return
 
-            # Crea un objeto youtube_dl con la URL del mix de YouTube
-            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url_mix, download=False)
+        if not self.is_youtube_url(query):
+            query = f"ytsearch:{query}"
 
-            # Extrae los nombres de los videos de la información obtenida
-            video_names = [entry['title'] for entry in info['entries']]
+        cancion = await self.descargar_async(query)
+        if not cancion:
+            await ctx.send("La ptm no seas monky, inserta una cancion valida")
+            return
 
-            # Devuelve la lista de nombres de los videos
-            return video_names
+        self.music_queue.append(cancion)
+        await ctx.send(f"({len(self.music_queue)} **{cancion['title']}** Añadido a tu cola ")
 
-        except Exception as e:
-            print("Ocurrió un error al obtener los nombres de los videos:", e)
-            return []
+        if not self.is_playing:
+            await self.reproducir(ctx)
 
-    @commands.command(name="mix", help="Reproduce una playlist de YouTube")
-    async def play_mix(self, ctx, *args):
-        query = ""
-        limit = 20
-
-        for i, arg in enumerate(args):
-            if arg == "-n" and i + 1 < len(args):
-                limit = int(args[i + 1])
-            else:
-                query += arg + " "
-
-        query = query.strip()
-        lista_music = self.obtener_nombres_mix_youtube(query)
-
-        for index, title in enumerate(lista_music):
-            if index < limit:
-                await self.play(ctx, title, send_message=index == 0)
-            else:
-                break
-
-    @commands.command(name="stop", help="Detiene y borra la lista actual de reproducción")
-    async def stop(self, ctx, *args):
+    @commands.command(name="skip", help="Salta la canción actual")
+    @in_voice_channel()
+    async def skip(self, ctx: commands.Context):
+        """Salta la canción actual."""
         if self.vc and self.vc.is_playing():
             self.vc.stop()
-        self.music_info = []
+            await ctx.send(" Canción saltada")
+            await self.reproducir(ctx)
+
+    @commands.command(name="queue", help="Muestra la cola de reproducción")
+    async def queue(self, ctx: commands.Context):
+        """Muestra la cola actual."""
+        if not self.music_queue:
+            await ctx.send("Tu Cola vacía")
+            return
+
+        queue_list = "\n".join([f"{i+1}. {song['title']}" for i, song in enumerate(self.music_queue)])
+        await ctx.send(f"**Cola actual ({len(self.music_queue)})**\n{queue_list}")
+
+    @commands.command(name="playnext", help="Añade una canción al principio de la cola")
+    @in_voice_channel()
+    async def play_next(self, ctx: commands.Context, *, query: str):
+        """Añade canción con prioridad."""
+        cancion = await self.descargar_async(query)
+        if cancion:
+            self.music_queue.appendleft(cancion)
+            await ctx.send(f"Canción añadida como próxima: **{cancion['title']}**")
+
+    @commands.command(name="volume", help="Ajusta el volumen (0-100)")
+    async def volume(self, ctx: commands.Context, volume: int):
+        """Control de volumen."""
+        if 0 <= volume <= 100:
+            self.volume = volume / 100
+            if self.vc and self.vc.source:
+                self.vc.source.volume = self.volume
+            await ctx.send(f" Volumen ajustado a {volume}%")
+        else:
+            await ctx.send(" Volumen debe estar entre 0 y 100")
+
+    @commands.command(name="stop", help="Detiene y limpia todo")
+    @in_voice_channel()
+    async def stop(self, ctx: commands.Context):
+        """Detiene completamente el bot."""
+        await self.cleanup()
+        await ctx.send("Reproducción detenida y cola limpiada")
+
+    @staticmethod
+    def is_youtube_url(query: str) -> bool:
+        """Valida URLs de YouTube."""
+        patterns = [
+            r'(https?://)?(www\.)?youtube\.com/watch\?v=',
+            r'(https?://)?(www\.)?youtu\.be/'
+        ]
+        return any(re.search(pattern, query) for pattern in patterns)
+
+    def get_ffmpeg_options(self):
+        if self.nightcore_active:
+            self.FFMPEG_OPTIONS = self.FFMPEG_OPTIONS_NIGHTCORE
+        else:
+            self.FFMPEG_OPTIONS = self.FFMPEG_OPTIONS_DEFAULTs
+    @commands.command()
+    async def nightcore(self, ctx):
+        self.nightcore_active = not self.nightcore_active
+        status = "activado" if self.nightcore_active else "desactivado"
+        self.get_ffmpeg_options()
+        await ctx.send(f"✨ Efecto Nightcore {status}")
